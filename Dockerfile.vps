@@ -1,0 +1,286 @@
+# Secure & Isolated VPS image
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install packages
+RUN apt-get update && \
+    apt-get install -y \
+    openssh-server \
+    sudo \
+    curl \
+    wget \
+    nano \
+    vim \
+    htop \
+    net-tools \
+    iputils-ping \
+    iptables \
+    fail2ban \
+    apparmor-utils \
+    python3 \
+    python3-pip \
+    nodejs \
+    npm \
+    git \
+    unzip \
+    zip \
+    tmux \
+    screen \
+    ffmpeg \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# SSH directory + generate fixed host keys at build time
+RUN mkdir -p /run/sshd && \
+    ssh-keygen -A
+
+# ============ SSH HARDENING ============
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    # Disable empty passwords
+    sed -i 's/#PermitEmptyPasswords no/PermitEmptyPasswords no/' /etc/ssh/sshd_config && \
+    # Disable X11 forwarding
+    sed -i 's/X11Forwarding yes/X11Forwarding no/' /etc/ssh/sshd_config && \
+    # Max auth tries
+    echo "MaxAuthTries 3" >> /etc/ssh/sshd_config && \
+    # Session timeout
+    echo "ClientAliveInterval 300" >> /etc/ssh/sshd_config && \
+    echo "ClientAliveCountMax 2" >> /etc/ssh/sshd_config && \
+    # DISABLE all forwarding (no tunnel abuse)
+    echo "AllowTcpForwarding no" >> /etc/ssh/sshd_config && \
+    echo "AllowStreamLocalForwarding no" >> /etc/ssh/sshd_config && \
+    echo "AllowAgentForwarding no" >> /etc/ssh/sshd_config && \
+    echo "GatewayPorts no" >> /etc/ssh/sshd_config && \
+    echo "PermitTunnel no" >> /etc/ssh/sshd_config && \
+    # Login settings
+    echo "LoginGraceTime 30" >> /etc/ssh/sshd_config && \
+    echo "MaxSessions 2" >> /etc/ssh/sshd_config && \
+    echo "MaxStartups 3:50:10" >> /etc/ssh/sshd_config && \
+    echo "Protocol 2" >> /etc/ssh/sshd_config && \
+    # ENABLE password authentication
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "PasswordAuthentication yes" >> /etc/ssh/sshd_config && \
+    # Disable SFTP (optional, prevent file hosting abuse)
+    sed -i 's/Subsystem\s*sftp.*/# SFTP disabled for security/' /etc/ssh/sshd_config
+
+# ============ CREATE RESTRICTED USER ============
+# Placeholder user - actual username created dynamically in entrypoint.sh
+RUN mkdir -p /home && \
+    chmod 700 /bin/su && \
+    chmod 700 /usr/bin/sudo && \
+    rm -f /etc/sudoers.d/* && \
+    passwd -l root
+
+# ============ FAIL2BAN ============
+RUN mkdir -p /etc/fail2ban && \
+    printf '[sshd]\nenabled = true\nport = 22\nfilter = sshd\nlogpath = /var/log/auth.log\nmaxretry = 3\nbantime = 600\nfindtime = 300\n' > /etc/fail2ban/jail.local
+
+# ============ BLOCK HACKING/MINING TOOLS ============
+RUN echo '#!/bin/bash\necho "BLOCKED: This tool is not allowed."' > /usr/local/bin/blocked && \
+    chmod +x /usr/local/bin/blocked && \
+    for tool in nmap masscan hydra sqlmap hashcat john nikto aircrack-ng \
+                xmrig minerd cpuminer bfgminer cgminer ethminer nbminer \
+                metasploit msfconsole beef-xss responder ettercap bettercap \
+                tcpdump wireshark tshark netcat nc ncat socat \
+                hping3 loic hoic slowloris goldeneye xerxes \
+                udpflood synflood torshammer iptables; do \
+        ln -sf /usr/local/bin/blocked /usr/local/bin/$tool 2>/dev/null; \
+    done
+
+# ============ FILESYSTEM SECURITY ============
+# Remove dangerous binaries that could be used for attacks
+RUN rm -f /usr/bin/wget /usr/bin/curl 2>/dev/null; \
+    # Re-install safe versions with restrictions
+    apt-get update && apt-get install -y curl wget && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Restrict access to /proc and /sys info leakage
+RUN echo 'kernel.dmesg_restrict = 1' >> /etc/sysctl.conf && \
+    echo 'kernel.kptr_restrict = 2' >> /etc/sysctl.conf && \
+    echo 'net.ipv4.conf.all.send_redirects = 0' >> /etc/sysctl.conf && \
+    echo 'net.ipv4.conf.default.send_redirects = 0' >> /etc/sysctl.conf && \
+    echo 'net.ipv4.ip_forward = 0' >> /etc/sysctl.conf
+
+# Install neofetch for system info display
+RUN apt-get update && apt-get install -y neofetch && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ============ USER DATA ISOLATION ============
+# Set strict permissions on system directories
+RUN chmod 700 /root && \
+    chmod 750 /etc/ssh && \
+    chmod 600 /etc/shadow && \
+    chmod 644 /etc/passwd && \
+    # Remove cron access for preventing scheduled attacks
+    touch /etc/cron.allow && \
+    echo "root" > /etc/cron.allow && \
+    # Restrict su access
+    chmod 750 /bin/su
+
+# ============ ANTI-MINER SCRIPT ============
+RUN printf '#!/bin/bash\n\
+# Kill crypto miners by process name\n\
+pkill -9 -f "xmrig|minerd|cpuminer|bfgminer|cgminer|ethminer|nbminer|t-rex|phoenixminer|lolminer" 2>/dev/null\n\
+pkill -9 -f "stratum\\+tcp|stratum\\+ssl|pool\\." 2>/dev/null\n\
+pkill -9 -f "randomx|cryptonight|kawpow|ethash|equihash" 2>/dev/null\n\
+pkill -9 -f "minergate|nicehash|hashfish|kryptex" 2>/dev/null\n\
+# Kill by known miner binary hashes (common names)\n\
+pkill -9 -f "\\./[a-z]{1,3}$" 2>/dev/null\n\
+# Kill hidden processes (dot prefix)\n\
+pkill -9 -f "^\\." 2>/dev/null\n\
+# Kill anything connecting to common mining ports\n\
+for pid in $(ss -tnp 2>/dev/null | grep -E ":3333|:4444|:5555|:7777|:8888|:9999|:14444|:14433" | grep -oP "pid=\\K[0-9]+"); do\n\
+    kill -9 $pid 2>/dev/null\n\
+done\n\
+# Kill any process using >80%% CPU for more than 60s\n\
+ps aux | awk '\''$3 > 80.0 {print $2}'\'' | while read pid; do\n\
+    if [ -f "/proc/$pid/status" ]; then\n\
+        age=$(($(date +%%s) - $(stat -c %%Y /proc/$pid/status 2>/dev/null || echo $(date +%%s))))\n\
+        if [ $age -gt 60 ]; then\n\
+            kill -9 $pid 2>/dev/null\n\
+            echo "[$(date)] KILLED mining suspect PID=$pid CPU>80%%" >> /var/log/miner_kills.log\n\
+        fi\n\
+    fi\n\
+done\n' > /usr/local/bin/antiminer.sh && chmod +x /usr/local/bin/antiminer.sh
+
+# ============ NETWORK SECURITY (FIREWALL) ============
+RUN printf '#!/bin/bash\n\
+# Block email ports (anti-spam)\n\
+iptables -A OUTPUT -p tcp --dport 25 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 465 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 587 -j DROP 2>/dev/null\n\
+# Block IRC (botnet C&C)\n\
+iptables -A OUTPUT -p tcp --dport 6667 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 6697 -j DROP 2>/dev/null\n\
+# Block common mining pool ports\n\
+iptables -A OUTPUT -p tcp --dport 3333 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 4444 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 5555 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 7777 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 8888 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 9999 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 14444 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 14433 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 3334 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 4445 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 5556 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 8443 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 9090 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 45560 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 45700 -j DROP 2>/dev/null\n\
+# Block known mining pools by domain (DNS based)\n\
+echo "127.0.0.1 pool.minergate.com" >> /etc/hosts\n\
+echo "127.0.0.1 xmr.pool.minergate.com" >> /etc/hosts\n\
+echo "127.0.0.1 nanopool.org" >> /etc/hosts\n\
+echo "127.0.0.1 xmrpool.eu" >> /etc/hosts\n\
+echo "127.0.0.1 supportxmr.com" >> /etc/hosts\n\
+echo "127.0.0.1 pool.hashvault.pro" >> /etc/hosts\n\
+echo "127.0.0.1 herominers.com" >> /etc/hosts\n\
+echo "127.0.0.1 moneroocean.stream" >> /etc/hosts\n\
+echo "127.0.0.1 hashvault.pro" >> /etc/hosts\n\
+echo "127.0.0.1 2miners.com" >> /etc/hosts\n\
+echo "127.0.0.1 f2pool.com" >> /etc/hosts\n\
+echo "127.0.0.1 poolin.com" >> /etc/hosts\n\
+echo "127.0.0.1 antpool.com" >> /etc/hosts\n\
+echo "127.0.0.1 viabtc.com" >> /etc/hosts\n\
+echo "127.0.0.1 nicehash.com" >> /etc/hosts\n\
+echo "127.0.0.1 ethermine.org" >> /etc/hosts\n\
+echo "127.0.0.1 flypool.org" >> /etc/hosts\n\
+echo "127.0.0.1 unmineable.com" >> /etc/hosts\n\
+echo "127.0.0.1 kryptex.com" >> /etc/hosts\n\
+echo "127.0.0.1 zpool.ca" >> /etc/hosts\n\
+echo "127.0.0.1 prohashing.com" >> /etc/hosts\n\
+echo "127.0.0.1 miningpoolhub.com" >> /etc/hosts\n\
+# Rate limit outbound connections (anti-DDoS)\n\
+iptables -A OUTPUT -p tcp --syn -m connlimit --connlimit-above 50 -j DROP 2>/dev/null\n\
+# Block port scanning from container\n\
+iptables -A OUTPUT -p tcp --tcp-flags ALL NONE -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --tcp-flags ALL ALL -j DROP 2>/dev/null\n\
+#\n\
+# ========== UDP FLOOD / DDoS PROTECTION ==========\n\
+# BLOCK ALL outbound UDP traffic (prevents UDP flood DDoS)\n\
+# Only allow DNS (port 53) for domain resolution\n\
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null\n\
+iptables -A OUTPUT -p udp -j DROP 2>/dev/null\n\
+# Block all UDP forwarding too\n\
+iptables -A FORWARD -p udp -j DROP 2>/dev/null\n\
+# Block raw sockets (used for spoofed UDP attacks)\n\
+iptables -A OUTPUT -p raw -j DROP 2>/dev/null\n\
+# Block ICMP flood (ping flood)\n\
+iptables -A OUTPUT -p icmp --icmp-type echo-request -m limit --limit 2/s --limit-burst 4 -j ACCEPT 2>/dev/null\n\
+iptables -A OUTPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null\n\
+# Block outbound on non-standard high ports used for amplification\n\
+iptables -A OUTPUT -p tcp --dport 17 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 19 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 111 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 123 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 137:139 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 389 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 1900 -j DROP 2>/dev/null\n\
+iptables -A OUTPUT -p tcp --dport 11211 -j DROP 2>/dev/null\n\
+' > /usr/local/bin/firewall.sh && chmod +x /usr/local/bin/firewall.sh
+
+# ============ PREVENT CONTAINER ESCAPE ============
+# Remove tools that could be used for container escape
+RUN rm -f /usr/bin/mount /usr/bin/umount /usr/bin/chroot 2>/dev/null; \
+    rm -f /usr/bin/nsenter /usr/bin/unshare 2>/dev/null; \
+    rm -f /usr/sbin/fdisk 2>/dev/null; \
+    rm -f /usr/sbin/mkfs.* 2>/dev/null; \
+    # Disable kernel module loading
+    mkdir -p /etc/modprobe.d && \
+    echo 'install cramfs /bin/true' >> /etc/modprobe.d/disable.conf && \
+    echo 'install freevxfs /bin/true' >> /etc/modprobe.d/disable.conf && \
+    echo 'install jffs2 /bin/true' >> /etc/modprobe.d/disable.conf || true
+
+# ============ CUSTOM TERMINAL BRANDING ============
+# PS1 and bashrc will be set in entrypoint.sh for the dynamic user
+RUN printf '\n\
+# Custom VPS Prompt\n\
+export PS1="\\n\\[\\033[1;35m\\]┌──[\\[\\033[1;36m\\]VishalCloud\\[\\033[1;35m\\]]─[\\[\\033[1;32m\\]\\u\\[\\033[1;33m\\]@\\[\\033[1;32m\\]\\h\\[\\033[1;35m\\]]─[\\[\\033[1;34m\\]\\w\\[\\033[1;35m\\]]\\n└──╼ \\[\\033[1;36m\\]\\$ \\[\\033[0m\\]"\n\
+export TERM=xterm-256color\n\
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n\
+alias ls="ls --color=auto"\n\
+alias ll="ls -la --color=auto"\n\
+alias cls="clear"\n\
+\n\
+' > /etc/skel/.bashrc_custom
+
+# MOTD Banner (shown on SSH login)
+RUN printf '\033[1;36m\n\
+╔═══════════════════════════════════════════════╗\n\
+║          ☁️  V I S H A L  C L O U D  ☁️           ║\n\
+╠═══════════════════════════════════════════════╣\n\
+║  ᴡᴇʟᴄᴏᴍᴇ ᴛᴏ ʏᴏᴜʀ ᴘʀɪᴠᴀᴛᴇ ᴠᴘs             ║\n\
+║                                               ║\n\
+║  • ᴍɪɴɪɴɢ/ʜᴀᴄᴋɪɴɢ = ɪɴsᴛᴀɴᴛ ʙᴀɴ           ║\n\
+║  • ᴛʜɪs sᴇssɪᴏɴ ɪs ᴍᴏɴɪᴛᴏʀᴇᴅ              ║\n\
+║  • ᴀʙᴜsᴇ ᴡɪʟʟ ʀᴇsᴜʟᴛ ɪɴ ᴛᴇʀᴍɪɴᴀᴛɪᴏɴ      ║\n\
+║                                               ║\n\
+║  📊 ᴛʏᴘᴇ "neofetch" ғᴏʀ sʏsᴛᴇᴍ ɪɴғᴏ        ║\n\
+╚═══════════════════════════════════════════════╝\n\
+\033[0m\n' > /etc/motd
+
+# Disable default Ubuntu MOTD scripts (keep only our custom one)
+RUN chmod -x /etc/update-motd.d/* 2>/dev/null || true && \
+    rm -f /etc/legal 2>/dev/null || true
+
+# Custom neofetch config (will be copied to user home in entrypoint)
+RUN mkdir -p /etc/skel/.config/neofetch && \
+    printf 'print_info() {\n\
+    info title\n\
+    info underline\n\
+    info "OS" distro\n\
+    info "Uptime" uptime\n\
+    info "Memory" memory\n\
+    info "CPU Usage" cpu_usage\n\
+    info "Disk" disk\n\
+    info "Local IP" local_ip\n\
+}\n' > /etc/skel/.config/neofetch/config.conf
+
+# Entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 22
+CMD ["/entrypoint.sh"]

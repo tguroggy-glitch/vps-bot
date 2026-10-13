@@ -1,0 +1,24 @@
+# Docker compose for VPS Bot infrastructure
+version: "3.8"
+
+services:
+  vps-bot:
+    build: .
+    container_name: vps_bot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./vps_bot.db:/app/vps_bot.db
+    working_dir: /app
+    command: python bot.py
+    depends_on:
+      - build-vps-image
+
+  build-vps-image:
+    image: docker:24-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace
+    command: docker build -t vps-ssh-secure -f /workspace/Dockerfile.vps /workspace
+    restart: "no"
